@@ -1,0 +1,456 @@
+#!/usr/bin/env python3
+# server.py
+"""
+Local integrated simulation server
+- Serves a client-side A/B simulation UI (embedded HTML/JS)
+- Accepts uploaded simulation JSON files (POST /upload)
+- Processes uploaded sessions automatically to CSV summary
+- Serves uploaded and processed files for download
+Security / usage notes:
+- Binds to 127.0.0.1 only (localhost). Do NOT expose to public networks.
+- Basic Auth protects the server UI and upload/download endpoints.
+- Intended for SAFE synthetic simulations on devices/accounts you control.
+- Change SIM_ADMIN_USER and SIM_ADMIN_PASS via environment variables.
+Requirements:
+  pip install flask werkzeug
+Run:
+  SIM_ADMIN_USER=admin SIM_ADMIN_PASS=changeme python server.py
+Then open: http://127.0.0.1:5000
+"""
+import os
+import pathlib
+import json
+import time
+import base64
+import statistics
+from flask import Flask, request, jsonify, send_from_directory, abort, Response, make_response
+
+# -------------------------
+# Configuration
+# -------------------------
+BASE_DIR = pathlib.Path(__file__).parent.resolve()
+UPLOAD_DIR = BASE_DIR / "uploads"
+PROCESSED_DIR = BASE_DIR / "processed"
+UPLOAD_DIR.mkdir(exist_ok=True)
+PROCESSED_DIR.mkdir(exist_ok=True)
+
+# Basic auth defaults (override via environment variables)
+ADMIN_USER = os.environ.get("SIM_ADMIN_USER", "admin")
+ADMIN_PASS = os.environ.get("SIM_ADMIN_PASS", "changeme")
+
+ALLOWED_EXT = {".json"}
+MAX_UPLOAD_MB = 20
+
+# -------------------------
+# Helper: Basic Auth
+# -------------------------
+def check_auth_header(auth_header):
+    """
+    Expecting header like: 'Basic base64(user:pass)'
+    """
+    if not auth_header:
+        return False
+    try:
+        scheme, credentials = auth_header.split(None, 1)
+        if scheme.lower() != "basic":
+            return False
+        decoded = base64.b64decode(credentials).decode("utf8", errors="ignore")
+        user, pw = decoded.split(":", 1)
+        return user == ADMIN_USER and pw == ADMIN_PASS
+    except Exception:
+        return False
+
+def require_auth():
+    return Response("Authentication required", 401, {"WWW-Authenticate": 'Basic realm="LocalSim"'})
+
+# -------------------------
+# Analysis functions (integrated from analyze_simulation.py)
+# -------------------------
+def compute_from_sessions(sessions):
+    """
+    Compute aggregated rows per variant:
+      - impressions, clicks, submissions, CTR, form_completion_rate, median_time_on_page, mean_time_on_page
+    Returns list of dict rows.
+    """
+    agg = {}
+    for s in sessions:
+        v = s.get("variant", "unknown")
+        agg.setdefault(v, {"impressions": 0, "clicks": 0, "submissions": 0, "times": []})
+        agg[v]["impressions"] += 1
+        if s.get("metrics", {}).get("clicked"):
+            agg[v]["clicks"] += 1
+        if s.get("metrics", {}).get("submitted"):
+            agg[v]["submissions"] += 1
+        t = s.get("metrics", {}).get("time_on_page_sec")
+        if t is not None:
+            try:
+                agg[v]["times"].append(float(t))
+            except Exception:
+                pass
+    rows = []
+    for v, d in agg.items():
+        times = d["times"]
+        median = statistics.median(times) if times else 0
+        mean = statistics.mean(times) if times else 0
+        ctr = (d["clicks"] / d["impressions"]) if d["impressions"] else 0
+        form_completion = (d["submissions"] / d["clicks"]) if d["clicks"] else 0
+        rows.append({
+            "variant": v,
+            "impressions": d["impressions"],
+            "clicks": d["clicks"],
+            "submissions": d["submissions"],
+            "CTR": ctr,
+            "form_completion_rate": form_completion,
+            "median_time_on_page": median,
+            "mean_time_on_page": mean
+        })
+    return rows
+
+def write_csv(rows, filename):
+    import csv
+    if not rows:
+        raise ValueError("No rows to write")
+    keys = list(rows[0].keys())
+    with open(filename, "w", newline="", encoding="utf8") as f:
+        writer = csv.DictWriter(f, fieldnames=keys)
+        writer.writeheader()
+        for r in rows:
+            writer.writerow(r)
+    return filename
+
+def analyze_sessions_file(input_path, out_dir=None):
+    """
+    Read a sessions JSON (structure: {sessions: [...]}) and create a CSV summary in out_dir.
+    Returns path to csv file.
+    """
+    input_path = pathlib.Path(input_path)
+    out_dir = pathlib.Path(out_dir or input_path.parent)
+    with open(input_path, "r", encoding="utf8") as f:
+        obj = json.load(f)
+    sessions = obj.get("sessions") or obj.get("session_pool") or []
+    if not sessions:
+        raise ValueError("No session records found in input")
+    rows = compute_from_sessions(sessions)
+    out_csv = out_dir / (input_path.stem + "_summary.csv")
+    write_csv(rows, str(out_csv))
+    return str(out_csv)
+
+# -------------------------
+# Flask app
+# -------------------------
+app = Flask(__name__)
+app.config["MAX_CONTENT_LENGTH"] = MAX_UPLOAD_MB * 1024 * 1024
+
+def is_allowed(filename):
+    return pathlib.Path(filename).suffix.lower() in ALLOWED_EXT
+
+# Embedded HTML page (client simulation). Kept self-contained; connects to /upload on same origin.
+# Note: this page is intentionally restricted (served from localhost). It performs client-side A/B simulation,
+# allows export of sessions JSON and can POST it to /upload.
+CLIENT_HTML = r"""
+<!doctype html>
+<html lang="ar" dir="rtl">
+<head>
+  <meta charset="utf-8">
+  <title>محاكاة آمنة A/B - Local Sim</title>
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; connect-src 'self'; img-src 'self' data:; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline';">
+  <style>
+    body{font-family:system-ui,Segoe UI,Arial; padding:18px; background:#f5f7fb; color:#222}
+    header{margin-bottom:12px}
+    h1{margin:0 0 6px 0; font-size:20px}
+    .card{background:#fff; border-radius:8px; padding:12px; margin-bottom:12px; box-shadow:0 2px 8px rgba(0,0,0,0.06)}
+    label{display:block; margin:6px 0 3px}
+    input[type=text], input[type=number], textarea{width:100%; padding:8px; border-radius:6px; border:1px solid #ddd}
+    button{background:#2c7be5;color:#fff;border:none;padding:8px 12px;border-radius:6px;cursor:pointer;margin:6px 6px 0 0}
+    button.secondary{background:#6c757d}
+    .log{font-family:monospace; font-size:13px; background:#0f1720; color:#cfe9ff; padding:8px; border-radius:6px; max-height:220px; overflow:auto}
+    .muted{color:#666; font-size:13px}
+    .flex{display:flex; gap:8px; align-items:center; flex-wrap:wrap}
+    .small{font-size:12px; color:#555}
+    table{width:100%; border-collapse:collapse}
+    th,td{padding:6px; border:1px solid #eee; text-align:right}
+  </style>
+</head>
+<body>
+  <header>
+    <h1>محاكاة آمنة A/B: رابط → صفحة هبوط → مسح QR / إدخال بيانات</h1>
+    <div class="muted">تشغيل محلي فقط — بيانات صناعية — لا تُرسل إلى أي جهة خارج جهازك ما لم ترفعها إلى خادمك المحلي.</div>
+  </header>
+
+  <div class="card" id="consentCard">
+    <h3>1) موافقة وتشغيل الوضع الآمن</h3>
+    <label>معرّف التجربة (experiment id)</label>
+    <input type="text" id="experimentId" placeholder="مثال: exp_whatsapp_sim_01">
+    <label>اسم الباحث</label>
+    <input type="text" id="researcherName" placeholder="اسمك أو مؤسستك">
+    <label><input type="checkbox" id="consentCheck"> أؤكد أنني سأستخدم هذه المحاكاة على أجهزتي/حساباتي الاختبارية فقط.</label>
+    <div class="flex">
+      <button id="enableSafeMode">تفعيل الوضع الآمن وتهيئة المحاكاة</button>
+      <button class="secondary" id="showGuidelines">إرشادات الاستخدام الآمن</button>
+    </div>
+  </div>
+
+  <div class="card" id="simControls" style="display:none">
+    <h3>2) إعداد A/B</h3>
+    <table>
+      <tr><th>عنصر</th><th>Variant A</th><th>Variant B</th></tr>
+      <tr>
+        <td>عنوان الإعلان</td>
+        <td><input type="text" id="adTitleA" value="تحديث أمان هام - WhatsApp"></td>
+        <td><input type="text" id="adTitleB" value="احصل على ميزة جديدة للواتساب الآن"></td>
+      </tr>
+      <tr>
+        <td>وصف الإعلان</td>
+        <td><input type="text" id="adDescA" value="انقر للاطلاع على تحديث أمني مهم."></td>
+        <td><input type="text" id="adDescB" value="ترقية سريعة لميزات الخصوصية — جرّب الآن."></td>
+      </tr>
+      <tr>
+        <td>احتمال النقر (0-1)</td>
+        <td><input type="number" id="clickProbA" min="0" max="1" step="0.01" value="0.25"></td>
+        <td><input type="number" id="clickProbB" min="0" max="1" step="0.01" value="0.35"></td>
+      </tr>
+      <tr>
+        <td>احتمال إرسال النموذج بعد النقر</td>
+        <td><input type="number" id="submitProbA" min="0" max="1" step="0.01" value="0.40"></td>
+        <td><input type="number" id="submitProbB" min="0" max="1" step="0.01" value="0.45"></td>
+      </tr>
+    </table>
+
+    <label style="margin-top:8px">عدد المحاكيات لكل متغير (مثلاً 50)</label>
+    <input type="number" id="runsPerVariant" value="50" min="1">
+
+    <div style="margin-top:8px" class="flex">
+      <button id="runAB">تشغيل A/B تلقائي</button>
+      <button id="exportAll" class="secondary">تنزيل جميع الجلسات كملف JSON</button>
+      <button id="downloadSummary" class="secondary">تنزيل ملخّص التجربة (Aggregated JSON)</button>
+      <button id="clearAll" class="secondary">مسح السجلات</button>
+    </div>
+  </div>
+
+  <div class="card" id="resultsCard" style="display:none">
+    <h3>النتائج المجمعة (مختصر)</h3>
+    <div id="summaryTable"></div>
+    <div style="margin-top:8px" class="small">يمكن تنزيل التفاصيل بصيغة JSON وتحليلها محلياً أو رفعها إلى خادمك المحلي.</div>
+
+    <div style="margin-top:8px">
+      <label>خيار رفع الملف إلى خادم محلي (رفع إلى /upload على نفس المضيف)</label>
+      <div class="flex">
+        <input type="file" id="fileToUpload" accept=".json">
+        <button id="uploadToServer" class="secondary">Upload to Local Server</button>
+      </div>
+      <div class="small muted">ملاحظة: الرفع يتطلب أن تشغّل server.py على جهازك وأن تكون لديك بيانات المصادقة.</div>
+    </div>
+  </div>
+
+  <div class="card" id="logsCard" style="display:none">
+    <h3>سجل الأحداث التجريبي (محلي، صناعي)</h3>
+    <div class="log" id="eventLog">لا توجد أحداث بعد.</div>
+  </div>
+
+  <footer style="margin-top:14px" class="small muted">
+    ملاحظة قانونية: هذه الأداة لأغراض البحث والمحاكاة فقط. لا تُستخدم لاستهداف أو اختراق أي فرد أو حساب حقيقي.
+  </footer>
+
+<script>
+/* Client-side simulation script (A/B) */
+const STATE = { enabled:false, experimentId:null, researcher:null, sessionPool:[] };
+function nowISO(){ return new Date().toISOString(); }
+function mkSessionId(){ return 'sim_' + Date.now() + '_' + Math.floor(Math.random()*10000); }
+function logToConsole(msg){ const el=document.getElementById('eventLog'); const prefix='['+nowISO()+'] '; if(el.textContent==='لا توجد أحداث بعد.') el.textContent=prefix+msg; else el.textContent += '\\n'+prefix+msg; el.scrollTop = el.scrollHeight; }
+
+document.getElementById('enableSafeMode').addEventListener('click', ()=>{
+  if(!document.getElementById('consentCheck').checked){ alert('يرجى الموافقة صراحةً.'); return; }
+  STATE.experimentId = document.getElementById('experimentId').value || ('exp_local_' + Date.now());
+  STATE.researcher = document.getElementById('researcherName').value || 'researcher_local';
+  STATE.sessionPool = [];
+  STATE.enabled = true;
+  document.getElementById('consentCard').style.display='none';
+  document.getElementById('simControls').style.display='block';
+  document.getElementById('resultsCard').style.display='block';
+  document.getElementById('logsCard').style.display='block';
+  logToConsole('safe-simulation-started: ' + STATE.experimentId);
+  alert('✅ الوضع الآمن مفعل.');
+});
+
+document.getElementById('runAB').addEventListener('click', async ()=>{
+  if(!STATE.enabled){ alert('فعّل الوضع الآمن أولاً.'); return; }
+  const runs = parseInt(document.getElementById('runsPerVariant').value) || 50;
+  const config = {
+    A:{ title: document.getElementById('adTitleA').value, desc: document.getElementById('adDescA').value, clickProb: parseFloat(document.getElementById('clickProbA').value)||0.25, submitProb: parseFloat(document.getElementById('submitProbA').value)||0.4 },
+    B:{ title: document.getElementById('adTitleB').value, desc: document.getElementById('adDescB').value, clickProb: parseFloat(document.getElementById('clickProbB').value)||0.35, submitProb: parseFloat(document.getElementById('submitProbB').value)||0.45 }
+  };
+  if(!confirm(`تشغيل A/B: ${runs} جلسة لكل من A وB. هل تتابع؟`)) return;
+
+  function simulateSession(variantConf, variantLabel){
+    const sid = mkSessionId();
+    const events = [];
+    const start = Date.now();
+    events.push({type:'page_view', ts: new Date(start).toISOString()});
+    const clicked = Math.random() < variantConf.clickProb;
+    if(clicked){
+      const tClick = start + (1000 + Math.floor(Math.random()*7000));
+      events.push({type:'click', ts: new Date(tClick).toISOString(), element:'ad_button'});
+      const submitted = Math.random() < variantConf.submitProb;
+      if(submitted){
+        const tSubmit = tClick + (500 + Math.floor(Math.random()*5000));
+        events.push({type:'form_submit', ts: new Date(tSubmit).toISOString(), form_fields:{username:'user_sim', password:'•••', otp:'XXXXXX'}});
+      }
+    } else {
+      if(Math.random() < 0.3) events.push({type:'scroll', ts: new Date(start + 2000).toISOString(), detail:{depth: Math.floor(Math.random()*80)}});
+    }
+    const end = Date.now();
+    const metrics = { time_on_page_sec: ((end - start)/1000).toFixed(2), clicked: clicked, submitted: events.some(e=>e.type==='form_submit') };
+    return { session_id: sid, variant: variantLabel, experiment_id: STATE.experimentId, researcher: STATE.researcher, meta:{synthetic:true, generated_at: nowISO()}, events, metrics };
+  }
+
+  for(const v of ['A','B']){
+    for(let i=0;i<runs;i++){
+      const s = simulateSession(config[v], v);
+      STATE.sessionPool.push(s);
+      logToConsole(`session_created ${s.session_id} variant=${v}`);
+      await new Promise(r=>setTimeout(r, 10));
+    }
+  }
+  updateSummaryDisplay();
+  alert('✅ انتهت المحاكاة. يمكنك تنزيل أو رفع النتيجة.');
+});
+
+function computeSummary(){
+  const totals = { A:{impressions:0, clicks:0, submissions:0, time_on_page:[]}, B:{impressions:0, clicks:0, submissions:0, time_on_page:[]} };
+  STATE.sessionPool.forEach(s=>{
+    const v = s.variant;
+    totals[v].impressions += 1;
+    if(s.metrics.clicked) totals[v].clicks += 1;
+    if(s.metrics.submitted) totals[v].submissions += 1;
+    totals[v].time_on_page.push(parseFloat(s.metrics.time_on_page_sec));
+  });
+  function summarize(arr){ if(arr.length===0) return {median:0, mean:0}; arr.sort((a,b)=>a-b); const mid = Math.floor(arr.length/2); const median = arr.length%2 ? arr[mid] : ((arr[mid-1]+arr[mid])/2); const mean = arr.reduce((a,b)=>a+b,0)/arr.length; return {median, mean}; }
+  return { experiment_id: STATE.experimentId, researcher: STATE.researcher, generated_at: nowISO(), variants: { A: { impressions: totals.A.impressions, clicks: totals.A.clicks, submissions: totals.A.submissions, CTR: totals.A.impressions? (totals.A.clicks / totals.A.impressions) : 0, form_completion_rate: totals.A.clicks ? (totals.A.submissions / totals.A.clicks) : 0, time_stats: summarize(totals.A.time_on_page) }, B: { impressions: totals.B.impressions, clicks: totals.B.clicks, submissions: totals.B.submissions, CTR: totals.B.impressions ? (totals.B.clicks / totals.B.impressions) : 0, form_completion_rate: totals.B.clicks ? (totals.B.submissions / totals.B.clicks) : 0, time_stats: summarize(totals.B.time_on_page) }, sessions_count: STATE.sessionPool.length } };
+}
+
+function updateSummaryDisplay(){
+  const summary = computeSummary();
+  const el = document.getElementById('summaryTable');
+  const html = `<table><tr><th>المعيار</th><th>Variant A</th><th>Variant B</th></tr><tr><td>Impressions</td><td>${summary.variants.A.impressions}</td><td>${summary.variants.B.impressions}</td></tr><tr><td>Clicks</td><td>${summary.variants.A.clicks}</td><td>${summary.variants.B.clicks}</td></tr><tr><td>Submissions</td><td>${summary.variants.A.submissions}</td><td>${summary.variants.B.submissions}</td></tr><tr><td>CTR</td><td>${(summary.variants.A.CTR*100).toFixed(2)}%</td><td>${(summary.variants.B.CTR*100).toFixed(2)}%</td></tr><tr><td>Form completion (of clicks)</td><td>${(summary.variants.A.form_completion_rate*100).toFixed(2)}%</td><td>${(summary.variants.B.form_completion_rate*100).toFixed(2)}%</td></tr><tr><td>Median time_on_page (s)</td><td>${summary.variants.A.time_stats.median.toFixed(2)}</td><td>${summary.variants.B.time_stats.median.toFixed(2)}</td></tr><tr><td>Mean time_on_page (s)</td><td>${summary.variants.A.time_stats.mean.toFixed(2)}</td><td>${summary.variants.B.time_stats.mean.toFixed(2)}</td></tr></table>`;
+  el.innerHTML = html;
+}
+
+document.getElementById('exportAll').addEventListener('click', ()=>{
+  if(!STATE.enabled || STATE.sessionPool.length===0){ alert('لا توجد جلسات للتصدير.'); return; }
+  const out = { meta:{experiment_id: STATE.experimentId, researcher: STATE.researcher, generated_at: nowISO(), note:'synthetic session pool'}, sessions: STATE.sessionPool };
+  const blob = new Blob([JSON.stringify(out, null, 2)], {type:'application/json'});
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a'); a.href = url; a.download = `sessions_${STATE.experimentId}_${Date.now()}.json`; document.body.appendChild(a); a.click(); a.remove(); URL.revokeObjectURL(url);
+  logToConsole('exported_all_sessions');
+});
+
+document.getElementById('downloadSummary').addEventListener('click', ()=>{
+  if(!STATE.enabled){ alert('لا توجد بيانات.'); return; }
+  const summary = computeSummary();
+  const blob = new Blob([JSON.stringify(summary, null, 2)], {type:'application/json'});
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a'); a.href = url; a.download = `summary_${STATE.experimentId}_${Date.now()}.json`; document.body.appendChild(a); a.click(); a.remove(); URL.revokeObjectURL(url);
+  logToConsole('exported_summary');
+});
+
+document.getElementById('clearAll').addEventListener('click', ()=> {
+  if(!confirm('مسح كل الجلسات من الذاكرة المحلية لهذه الصفحة؟')) return;
+  STATE.sessionPool = []; document.getElementById('eventLog').textContent='لا توجد أحداث بعد.'; document.getElementById('summaryTable').innerHTML=''; logToConsole('cleared_session_pool'); alert('✅ تم المسح محلياً.');
+});
+
+/* Upload to local server */
+document.getElementById('uploadToServer').addEventListener('click', async ()=>{
+  const fileInput = document.getElementById('fileToUpload');
+  const file = fileInput.files[0];
+  if(!file){ alert('اختر ملف JSON لترفعه.'); return; }
+  if(!confirm('رفع الملف سيتم إلى /upload على هذا المضيف (localhost). تأكد أنك تشغّل الخادم ولديك بيانات المصادقة.')) return;
+  try {
+    const form = new FormData();
+    form.append('file', file);
+    const res = await fetch('/upload', { method:'POST', body: form, credentials: 'same-origin' });
+    if(res.status === 401){
+      alert('الخادم طلب مصادقة. أدخل بيانات الدخول في مربع تسجيل المتصفح (Basic Auth).');
+      // browser will prompt for basic auth if 401 with WWW-Authenticate header returned
+      return;
+    }
+    if(!res.ok){ const txt = await res.text(); alert('Upload failed: ' + res.status + ' - ' + txt); return; }
+    const json = await res.json();
+    alert('✅ Upload successful. Server response: ' + JSON.stringify(json));
+    logToConsole('uploaded_to_server: ' + file.name);
+  } catch(err){ alert('خطأ أثناء الرفع: ' + err.message); }
+});
+
+/* show guidelines */
+document.getElementById('showGuidelines').addEventListener('click', ()=> {
+  alert('إرشادات آمنة:\n- استخدم بيانات صناعية فقط.\n- لا ترسل أي شيء إلى أطراف خارجية غير خادمك المحلي.\n- لا تستخدم ضد أي شخص حقيقي.');
+});
+</script>
+</body>
+</html>
+"""
+
+# -------------------------
+# Routes
+# -------------------------
+@app.route("/", methods=["GET"])
+def ui_root():
+    # Serve the HTML client page (no auth required to GET the client so researcher can open it),
+    # but uploads and processed endpoints are protected.
+    # We still print note for safety.
+    resp = make_response(CLIENT_HTML)
+    # set CSP header again
+    resp.headers["Content-Security-Policy"] = "default-src 'self'; connect-src 'self'; img-src 'self' data:; script-src 'self'; style-src 'self' 'unsafe-inline'"
+    return resp
+
+@app.route("/upload", methods=["POST"])
+def upload():
+    # Protect upload endpoint with basic auth
+    auth = request.headers.get("Authorization")
+    if not check_auth_header(auth):
+        return require_auth()
+    if "file" not in request.files:
+        abort(400, "no file part")
+    f = request.files["file"]
+    if f.filename == "":
+        abort(400, "no selected file")
+    filename = pathlib.Path(f.filename).name
+    if not is_allowed(filename):
+        abort(400, "invalid extension")
+    timestamp = int(time.time())
+    dest = UPLOAD_DIR / f"{timestamp}_{filename}"
+    f.save(dest)
+    # process file (analyze) immediately
+    try:
+        csvpath = analyze_sessions_file(str(dest), out_dir=str(PROCESSED_DIR))
+        summary = {"filename": dest.name, "received_at": time.ctime(), "processed_csv": pathlib.Path(csvpath).name}
+        out_json = PROCESSED_DIR / (dest.name + ".summary.json")
+        with open(out_json, "w", encoding="utf8") as ou:
+            json.dump(summary, ou, indent=2, ensure_ascii=False)
+        return jsonify({"status": "ok", "summary": summary})
+    except Exception as e:
+        return jsonify({"status": "error", "error": str(e)}), 500
+
+@app.route("/uploads/<path:fname>")
+def get_upload(fname):
+    auth = request.headers.get("Authorization")
+    if not check_auth_header(auth):
+        return require_auth()
+    return send_from_directory(str(UPLOAD_DIR), fname, as_attachment=True)
+
+@app.route("/processed/<path:fname>")
+def get_processed(fname):
+    auth = request.headers.get("Authorization")
+    if not check_auth_header(auth):
+        return require_auth()
+    return send_from_directory(str(PROCESSED_DIR), fname, as_attachment=True)
+
+# -------------------------
+# CLI launcher
+# -------------------------
+if __name__ == "__main__":
+    print("Local Simulation Server")
+    print("Admin user:", ADMIN_USER)
+    print("Start server on http://127.0.0.1:5000")
+    print("Note: change SIM_ADMIN_USER / SIM_ADMIN_PASS env vars to secure credentials")
+    app.run(host="127.0.0.1", port=5000, debug=False)
