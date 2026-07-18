@@ -1,0 +1,80 @@
+<!doctype html>
+<html lang="ar" dir="rtl">
+<head>
+  <meta charset="utf-8">
+  <title>محاكاة آمنة A/B</title>
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; img-src 'self' data:; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline';">
+  <style>
+    body{font-family:system-ui,Segoe UI,Arial; padding:18px; background:#f5f7fb; color:#222}
+    header{margin-bottom:12px}
+    h1{margin:0 0 6px 0; font-size:20px}
+    .card{background:#fff; border-radius:8px; padding:12px; margin-bottom:12px; box-shadow:0 2px 8px rgba(0,0,0,0.06)}
+    label{display:block; margin:6px 0 3px}
+    input[type=text], input[type=number], textarea{width:100%; padding:8px; border-radius:6px; border:1px solid #ddd}
+    button{background:#2c7be5;color:#fff;border:none;padding:8px 12px;border-radius:6px;cursor:pointer;margin:6px 6px 0 0}
+    .log{font-family:monospace; font-size:13px; background:#0f1720; color:#cfe9ff; padding:8px; border-radius:6px; max-height:200px; overflow:auto}
+    .muted{color:#666; font-size:13px}
+  </style>
+</head>
+<body>
+  <header>
+    <h1>محاكاة آمنة A/B</h1>
+    <div class="muted">افتح هذا الملف محليًا أو انشره على GitHub Pages للمعاينة الستاتيكية. جميع البيانات صناعية.</div>
+  </header>
+
+  <div class="card">
+    <h3>تشغيل سريع</h3>
+    <p>اضغط تفعيل ثم شغّل A/B. استخدم زر تنزيل لحفظ JSON محليًا.</p>
+    <label>Experiment id</label>
+    <input id="experimentId" value="exp_local_01">
+    <div style="margin-top:8px">
+      <button id="startBtn">تفعيل المحاكاة</button>
+      <button id="runBtn" disabled>تشغيل 20 محاكاة (A/B)</button>
+      <button id="downloadBtn" disabled>تنزيل JSON</button>
+    </div>
+    <div style="margin-top:8px" class="log" id="log">لا توجد أحداث بعد.</div>
+  </div>
+
+<script>
+let pool = [];
+function log(msg){ const el=document.getElementById('log'); el.textContent += '\\n['+new Date().toISOString()+'] '+msg; el.scrollTop = el.scrollHeight; }
+document.getElementById('startBtn').addEventListener('click', ()=> {
+  pool = []; document.getElementById('runBtn').disabled=false; document.getElementById('downloadBtn').disabled=true; log('Simulation enabled'); alert('تم تفعيل المحاكاة المحلية.');
+});
+document.getElementById('runBtn').addEventListener('click', async ()=>{
+  const exp = document.getElementById('experimentId').value || 'exp_local';
+  for(let i=0;i<20;i++){
+    // simple random A/B
+    const variant = Math.random() < 0.5 ? 'A' : 'B';
+    const sid = 'sim_' + Date.now() + '_' + Math.floor(Math.random()*10000);
+    const start = Date.now();
+    const events = [{type:'page_view', ts: new Date(start).toISOString()}];
+    const clicked = Math.random() < (variant==='A' ? 0.25 : 0.35);
+    if(clicked){
+      const tClick = start + (500 + Math.floor(Math.random()*4000));
+      events.push({type:'click', ts: new Date(tClick).toISOString(), element:'ad_button'});
+      const submitted = Math.random() < 0.4;
+      if(submitted){
+        const tSubmit = tClick + (200 + Math.floor(Math.random()*3000));
+        events.push({type:'form_submit', ts: new Date(tSubmit).toISOString(), form_fields:{username:'user_sim', password:'•••'}});
+      }
+    }
+    const metrics = { time_on_page_sec: ((Date.now() - start)/1000).toFixed(2), clicked: clicked, submitted: events.some(e=>e.type==='form_submit') };
+    pool.push({ session_id: sid, variant, experiment_id: exp, meta:{synthetic:true, generated_at:new Date().toISOString()}, events, metrics });
+    log('created ' + sid + ' variant=' + variant);
+    await new Promise(r=>setTimeout(r, 50));
+  }
+  document.getElementById('downloadBtn').disabled=false;
+  alert('انتهت المحاكاة المحلية.');
+});
+document.getElementById('downloadBtn').addEventListener('click', ()=> {
+  const out = { meta:{experiment_id: document.getElementById('experimentId').value, note:'synthetic'}, sessions: pool };
+  const blob = new Blob([JSON.stringify(out, null, 2)], {type:'application/json'});
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a'); a.href=url; a.download = 'sessions_local.json'; document.body.appendChild(a); a.click(); a.remove(); URL.revokeObjectURL(url);
+  log('downloaded sessions JSON');
+});
+</script>
+</body>
+</html>
