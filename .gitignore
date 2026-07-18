@@ -1,0 +1,6 @@
+name=.gitignore
+uploads/
+processed/
+__pycache__/
+*.pyc
+.env
