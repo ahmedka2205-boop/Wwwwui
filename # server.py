@@ -8,11 +8,11 @@ Local integrated simulation server
 - Serves uploaded and processed files for download
 Security / usage notes:
 - Binds to 127.0.0.1 only (localhost). Do NOT expose to public networks.
-- Basic Auth protects the server UI and upload/download endpoints.
+- Basic Auth protects the upload/download endpoints.
 - Intended for SAFE synthetic simulations on devices/accounts you control.
 - Change SIM_ADMIN_USER and SIM_ADMIN_PASS via environment variables.
 Requirements:
-  pip install flask werkzeug
+  pip install -r requirements.txt
 Run:
   SIM_ADMIN_USER=admin SIM_ADMIN_PASS=changeme python server.py
 Then open: http://127.0.0.1:5000
@@ -64,7 +64,7 @@ def require_auth():
     return Response("Authentication required", 401, {"WWW-Authenticate": 'Basic realm="LocalSim"'})
 
 # -------------------------
-# Analysis functions (integrated from analyze_simulation.py)
+# Analysis functions (integrated)
 # -------------------------
 def compute_from_sessions(sessions):
     """
@@ -144,9 +144,7 @@ app.config["MAX_CONTENT_LENGTH"] = MAX_UPLOAD_MB * 1024 * 1024
 def is_allowed(filename):
     return pathlib.Path(filename).suffix.lower() in ALLOWED_EXT
 
-# Embedded HTML page (client simulation). Kept self-contained; connects to /upload on same origin.
-# Note: this page is intentionally restricted (served from localhost). It performs client-side A/B simulation,
-# allows export of sessions JSON and can POST it to /upload.
+# Embedded HTML page (client simulation). Self-contained.
 CLIENT_HTML = r"""
 <!doctype html>
 <html lang="ar" dir="rtl">
@@ -371,7 +369,6 @@ document.getElementById('uploadToServer').addEventListener('click', async ()=>{
     const res = await fetch('/upload', { method:'POST', body: form, credentials: 'same-origin' });
     if(res.status === 401){
       alert('الخادم طلب مصادقة. أدخل بيانات الدخول في مربع تسجيل المتصفح (Basic Auth).');
-      // browser will prompt for basic auth if 401 with WWW-Authenticate header returned
       return;
     }
     if(!res.ok){ const txt = await res.text(); alert('Upload failed: ' + res.status + ' - ' + txt); return; }
@@ -389,23 +386,17 @@ document.getElementById('showGuidelines').addEventListener('click', ()=> {
 </body>
 </html>
 """
-
 # -------------------------
 # Routes
 # -------------------------
 @app.route("/", methods=["GET"])
 def ui_root():
-    # Serve the HTML client page (no auth required to GET the client so researcher can open it),
-    # but uploads and processed endpoints are protected.
-    # We still print note for safety.
     resp = make_response(CLIENT_HTML)
-    # set CSP header again
     resp.headers["Content-Security-Policy"] = "default-src 'self'; connect-src 'self'; img-src 'self' data:; script-src 'self'; style-src 'self' 'unsafe-inline'"
     return resp
 
 @app.route("/upload", methods=["POST"])
 def upload():
-    # Protect upload endpoint with basic auth
     auth = request.headers.get("Authorization")
     if not check_auth_header(auth):
         return require_auth()
@@ -420,7 +411,6 @@ def upload():
     timestamp = int(time.time())
     dest = UPLOAD_DIR / f"{timestamp}_{filename}"
     f.save(dest)
-    # process file (analyze) immediately
     try:
         csvpath = analyze_sessions_file(str(dest), out_dir=str(PROCESSED_DIR))
         summary = {"filename": dest.name, "received_at": time.ctime(), "processed_csv": pathlib.Path(csvpath).name}
